@@ -1,0 +1,107 @@
+name: Sync with Upstream
+
+on:
+  schedule:
+    # Runs daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/anthropics/skills.git || true
+          git fetch upstream
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          # Get current branch
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "current_branch=$CURRENT_BRANCH" >> $GITHUB_OUTPUT
+
+          # Check if there are upstream changes
+          UPSTREAM_CHANGES=$(git rev-list HEAD..upstream/main --count)
+          echo "upstream_changes=$UPSTREAM_CHANGES" >> $GITHUB_OUTPUT
+
+          if [ "$UPSTREAM_CHANGES" -eq "0" ]; then
+            echo "No upstream changes detected"
+            exit 0
+          fi
+
+          echo "Found $UPSTREAM_CHANGES commits from upstream"
+
+          # Try to merge upstream changes
+          if git merge upstream/main --no-edit; then
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+            echo "Successfully merged upstream changes"
+          else
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+            echo "Merge conflict detected"
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push changes
+        if: steps.sync.outputs.merge_status == 'success' && steps.sync.outputs.upstream_changes != '0'
+        run: |
+          git push origin ${{ steps.sync.outputs.current_branch }}
+
+      - name: Create issue on conflict
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🚨 Upstream Sync Failed - Merge Conflict Detected',
+              body: `## Sync Failed
+
+              The automated sync with [anthropics/skills](https://github.com/anthropics/skills) failed due to merge conflicts.
+
+              ### Action Required
+              1. Manually resolve conflicts:
+                 \`\`\`bash
+                 git fetch upstream
+                 git merge upstream/main
+                 # Resolve conflicts
+                 git commit
+                 git push
+                 \`\`\`
+
+              2. Or reset to upstream (⚠️ loses local changes):
+                 \`\`\`bash
+                 git reset --hard upstream/main
+                 git push --force
+                 \`\`\`
+
+              **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`,
+              labels: ['sync-conflict', 'automated']
+            });
+            console.log('Created issue:', issue.data.number);
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.sync.outputs.merge_status }}" == "success" ]; then
+            echo "✅ Successfully synced ${{ steps.sync.outputs.upstream_changes }} commits from upstream" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.sync.outputs.upstream_changes }}" == "0" ]; then
+            echo "✅ Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Sync failed due to merge conflicts. Manual intervention required." >> $GITHUB_STEP_SUMMARY
+          fi
